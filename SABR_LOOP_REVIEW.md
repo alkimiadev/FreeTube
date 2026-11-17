@@ -223,7 +223,7 @@ unbounded-chain hole (§3.3).
    breakouts (backoff-loop fake reload, NRP-retry cap, redirect loop), and reload requests
    per video view. This is the measuring stick for every other item, and doubles as the
    evidence generator for a future upstream contribution (#10090 asked for such data).
-2. [ ] **B. §5.2 redirect cap (`SabrSchemePlugin.js`).** Per-op redirect counter plus
+2. [x] **B. §5.2 redirect cap (`SabrSchemePlugin.js`).** Per-op redirect counter plus
    self-redirect detection (target normalizing to the current `sabrUrl` modulo `rn`);
    on trip, use the same breakout as the backoff watchdog (abort + `reload` emit).
    Closes the only unbounded recursion.

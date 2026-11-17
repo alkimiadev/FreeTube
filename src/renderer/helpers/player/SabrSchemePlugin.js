@@ -310,6 +310,28 @@ function decodePart(data, decoder) {
   }
 }
 
+const MAX_SABR_REDIRECTS_PER_REQUEST = 5
+
+/**
+ * Checks whether a `SABR_REDIRECT` target is the endpoint the stream is already using,
+ * modulo the `rn` request counter this client sets itself. Honoring such a redirect
+ * means recursing on the identical request.
+ * @param {string} redirectUrlString
+ * @param {string} currentUrlString
+ * @returns {boolean}
+ */
+function isSelfSabrRedirect(redirectUrlString, currentUrlString) {
+  try {
+    const redirectUrl = new URL(redirectUrlString)
+    const currentUrl = new URL(currentUrlString)
+    redirectUrl.searchParams.delete('rn')
+    currentUrl.searchParams.delete('rn')
+    return redirectUrl.href === currentUrl.href
+  } catch {
+    return false
+  }
+}
+
 /**
  * @param {(args: void) => void} callback
  * @param {number} timeoutMs
@@ -418,6 +440,31 @@ async function doRequest(
           case UMPPartId.SABR_REDIRECT: {
             const sabrRedirect = decodePart(data, SabrRedirect)
             if (!sabrRedirect?.url) break
+
+            currentState.cumulativeRedirects += 1
+
+            // A redirect chain that points back at the current endpoint or ping-pongs
+            // between endpoints would otherwise recurse without any bound: the retry
+            // counter only covers NextRequestPolicy retries (see the
+            // `shouldRetryDueToNextRequestPolicy` check below). Convert such loops
+            // into the same breakout the backoff watchdog uses.
+            const isSelfRedirect = isSelfSabrRedirect(sabrRedirect.url, currentState.sabrStreamState.sabrUrl)
+
+            if (isSelfRedirect || currentState.cumulativeRedirects > MAX_SABR_REDIRECTS_PER_REQUEST) {
+              if (SABR_DIAGNOSTICS) {
+                logSabrDiagnosticBreakout(
+                  isSelfRedirect ? 'self redirect' : 'redirect cap',
+                  currentState
+                )
+              }
+
+              currentState.sabrStreamState.playerReloadRequested = true
+              if (!currentState.abortController.signal.aborted) {
+                currentState.abortController.abort()
+                currentState.eventEmitter.emit('reload')
+              }
+              break
+            }
 
             currentState.sabrStreamState.sabrUrl = sabrRedirect.url
             shouldRetry = true
