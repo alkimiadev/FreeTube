@@ -251,6 +251,18 @@ unbounded-chain hole (§3.3).
    (`errorMessage`), matching how player errors such as 403 are surfaced. The cooldown
    blocks-and-waits rather than dropping the request, because a dropped reload would
    strand a scheme state with `playerReloadRequested = true` and no recovery path.
+   (c) *Second tuning pass (post-retest evidence).* The maintainer's second dev-build
+   log showed the softened watchdog tripping **exactly at the 15 s threshold**
+   (`11 NRP retries, 6 backoffs + 6 floored waits, cumulative ~15-16 s`) — i.e. an op
+   still inside what looks like a legitimate server-side *slow start* (NRP pacing cycles
+   before the segment arrives), not a stuck stream. Combined with the first log, the
+   historical signature of upstream reports ("reload every 5-10 seconds") is fully
+   explained by the **original ≥3-backoff tripwire** (trip at ~6.6 s + full page reload ≈
+   one reload every ~7 s). The watchdog is therefore now purely time-based (≥30 s
+   cumulative waiting, plus the op-timeout arm), the request-count arm was removed, and
+   the backoff floor was extended to sub-250 ms positive backoff values so that request
+   *rate* (unlike count) stays bounded for all backoff shapes. Request count remains
+   bounded by the NRP retry cap (≥100/op), and reload frequency by the view governor.
 5. [ ] **E. Backoff-aware timeout (`SabrSchemePlugin.js:263`).** Let each backoff wait
    push the op deadline forward so long-but-legitimate backoffs don't churn
    abort/retry cycles. Needs care with shaka's retry semantics — deliberately last.

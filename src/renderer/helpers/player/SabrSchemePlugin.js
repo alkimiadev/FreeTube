@@ -68,8 +68,9 @@ function logSabrDiagnosticBreakout(reason, currentState) {
     `${diagnosticPostTimestamps.length}/min POSTs (60 s window), ${diagnosticTotalPostCount} session total; ` +
     `op: ${currentState.cumulativeRetryDueToNextRequestPolicy} NRP retries, ` +
     `${currentState.cumulativeBackOffRequested} backoffs (cumulative ${currentState.cumulativeBackOffTimeMs} ms), ` +
-    `${currentState.immediateRetryWaitCount} immediate-retry waits, ` +
-    `${currentState.cumulativeRedirects} redirects`
+    `${currentState.flooredBackoffWaitCount} floored waits, ` +
+    `${currentState.cumulativeRedirects} redirects, ` +
+    `${currentState.receivedMediaBytes} media bytes received this op`
   )
 }
 
@@ -108,7 +109,8 @@ function logSabrDiagnosticBreakout(reason, currentState) {
  * @property {number} cumulativeBackOffRequested
  * @property {number} cumulativeRetryDueToNextRequestPolicy
  * @property {number} cumulativeRedirects
- * @property {number} immediateRetryWaitCount
+ * @property {number} flooredBackoffWaitCount
+ * @property {number} receivedMediaBytes
  */
 /**
  * @typedef SabrStreamState
@@ -312,19 +314,25 @@ function decodePart(data, decoder) {
 
 const MAX_SABR_REDIRECTS_PER_REQUEST = 5
 
-// Measured from real playback (instrumentation baseline): a healthy SABR stream
-// legitimately issues ~3 readahead backoffs totaling ~6.6 s within a single request op
-// early in a video, so a player reload must not be ordered below that; pathological
-// backoff loops are caught by the cumulative-time and request-count arms instead.
-const MAX_LEGIT_BACKOFF_REQUESTS_PER_OP = 12
-const MAX_LEGIT_CUMULATIVE_BACKOFF_MS = 15000
+// Instrumentation baselines (maintainer's dev-build console logs, 2026-11-17) show a
+// healthy SABR stream running long "slow start" pacing cycles early in a video: one op
+// legitimately polls ~11 times over ~16 s (mix of ~2 s readahead backoffs and
+// immediate-retry waits) before its segment arrives. Reloading below that just loses a
+// race the server was already winning, so the watchdog is purely time-based: an op that
+// has waited MAX_LEGIT_CUMULATIVE_BACKOFF_MS without completing is ordered a (view-level
+// governed) fake reload. Request *count* stays bounded by the NRP retry cap (>= 100 per
+// op) and request *rate* by the backoff floor below.
+const MIN_SABR_BACKOFF_MS = 250
+const MAX_LEGIT_CUMULATIVE_BACKOFF_MS = 30000
 
 /**
- * Jittered floor wait for SABR immediate retries (`NextRequestPolicy.backoffTimeMs`
- * 0/absent). Spreads otherwise synchronized bursts and degrades them gracefully.
+ * Jittered floor wait for SABR backoff requests below MIN_SABR_BACKOFF_MS (including the
+ * 0/absent "issue the next request immediately" case). Spreads otherwise synchronized
+ * bursts and degrades them gracefully. Without this, backoffTimeMs values of 0-small
+ * integers produce bursts of identical POSTs at network speed.
  * @returns {number} 250-1000 ms
  */
-function getImmediateRetryFloorDelayMs() {
+function getFlooredBackoffDelayMs() {
   return 250 + Math.floor(Math.random() * 751)
 }
 
@@ -398,20 +406,21 @@ async function doRequest(
     const nextRequestPolicy = currentState.sabrStreamState.nextRequestPolicy
     if (nextRequestPolicy) {
       // The `backoffTimeMs` proto field is optional; a 0/absent value means "issue the
-      // next request immediately". Honoring that at network speed produced bursts of up
-      // to the NRP retry cap worth of identical POSTs, so immediate-retry requests get
-      // a jittered floor wait instead. Only genuine positive backoffs count as
-      // "backoff requested" (emitted event, tripwire counter), so that a legitimate
-      // zero-backoff policy can never turn a request burst into a reload burst.
+      // next request immediately", and small positive values rate-limit the stream
+      // barely at all. Both are floored to the jittered MIN_SABR_BACKOFF_MS floor so
+      // retry bursts cannot run at network speed. Only genuine backoffs at or above
+      // the floor count as "backoff requested" (used for the progress-toast event), so
+      // that a legitimate zero-backoff policy can never turn a request burst into a
+      // reload burst.
       const rawBackoffTimeMs = nextRequestPolicy.backoffTimeMs || 0
-      const currentBackoffTimeMs = rawBackoffTimeMs > 0
+      const currentBackoffTimeMs = rawBackoffTimeMs >= MIN_SABR_BACKOFF_MS
         ? rawBackoffTimeMs
-        : getImmediateRetryFloorDelayMs()
+        : getFlooredBackoffDelayMs()
 
-      if (rawBackoffTimeMs > 0) {
+      if (rawBackoffTimeMs >= MIN_SABR_BACKOFF_MS) {
         currentState.eventEmitter.emit('backoff-requested', { backoffMs: rawBackoffTimeMs })
       } else if (SABR_DIAGNOSTICS) {
-        currentState.immediateRetryWaitCount += 1
+        currentState.flooredBackoffWaitCount += 1
       }
 
       // Wait but can be aborted
@@ -429,18 +438,14 @@ async function doRequest(
         currentState.cumulativeBackOffRequested += 1
       }
 
-      if (rawBackoffTimeMs > 0) {
-        const timeoutMs = operationInputs.request.retryParameters.timeout
-        // Detect infinite backoff loops by cumulative waiting time and request count;
-        // the op timeout also covers excessive total waiting. Legitimate readahead
-        // pacing (see MAX_LEGIT_* constants) stays below all of these.
-        if (
-          currentState.cumulativeBackOffRequested >= MAX_LEGIT_BACKOFF_REQUESTS_PER_OP ||
-          currentState.cumulativeBackOffTimeMs >= MAX_LEGIT_CUMULATIVE_BACKOFF_MS ||
-          (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))
-        ) {
-          shouldReloadDueToBackoffLoop = true
-        }
+      // Time-based only on purpose (see MAX_LEGIT_CUMULATIVE_BACKOFF_MS). The op-wide
+      // timeout is kept as an arm so user-configured shorter timeouts still recover.
+      const timeoutMs = operationInputs.request.retryParameters.timeout
+      if (
+        currentState.cumulativeBackOffTimeMs >= MAX_LEGIT_CUMULATIVE_BACKOFF_MS ||
+        (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))
+      ) {
+        shouldReloadDueToBackoffLoop = true
       }
     }
     if (shouldReloadDueToBackoffLoop || currentState.cumulativeRetryDueToNextRequestPolicy >= 100) {
@@ -535,7 +540,13 @@ async function doRequest(
           }
           case UMPPartId.MEDIA: {
             if (mediaHeaderId === data.getUint8(0)) {
-              responseDataChunks.push(...data.split(1).remainingBuffer.chunks)
+              const chunks = data.split(1).remainingBuffer.chunks
+              if (SABR_DIAGNOSTICS) {
+                for (const chunk of chunks) {
+                  currentState.receivedMediaBytes += chunk.byteLength
+                }
+              }
+              responseDataChunks.push(...chunks)
             }
             break
           }
@@ -979,7 +990,8 @@ export function setupSabrScheme(sabrData, getPlayer, getManifest, playerWidth, p
       cumulativeBackOffRequested: 0,
       cumulativeRetryDueToNextRequestPolicy: 0,
       cumulativeRedirects: 0,
-      immediateRetryWaitCount: 0,
+      flooredBackoffWaitCount: 0,
+      receivedMediaBytes: 0,
     }
 
     const pendingRequest = doRequest(opInputs, currentState)
