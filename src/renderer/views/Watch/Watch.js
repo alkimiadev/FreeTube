@@ -66,6 +66,23 @@ const UNAVAILABLE_VIDEO_THUMBNAILS = {
   dark: 'https://www.youtube.com/img/desktop/unavailable/unavailable_video_dark_theme.png'
 }
 
+// Governor for SABR-triggered player reloads (`onSabrReloadRequested`). Reloads are not
+// throttled-and-dropped (a dropped reload strands the dead scheme state without any
+// recovery path); instead each request waits out an escalating cooldown, and after
+// MAX_SABR_RELOADS_PER_VIDEO consecutive reloads of the same video the watch page
+// surfaces its error state instead of hammering YouTube again. The count decays after
+// a quiet period so infrequent legitimate reloads don't accumulate towards the cap.
+const SABR_RELOADS_COOLDOWN_MS = [0, 2000, 5000, 5000, 15000]
+const MAX_SABR_RELOADS_PER_VIDEO = 5
+const SABR_RELOADS_COUNT_DECAY_MS = 5 * 60 * 1000
+
+/**
+ * @param {number} ms
+ */
+function sabrReloadGovernorSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export default defineComponent({
   name: 'Watch',
   components: {
@@ -170,6 +187,14 @@ export default defineComponent({
       playabilityStatus: '',
       totalAdTimeSeconds: 0,
       adEndTimeUnixMs: 0,
+
+      // SABR reload governor (server-initiated player reloads)
+      /** @type {boolean} */
+      isReloadingView: false,
+      /** @type {number} */
+      sabrReloadCount: 0,
+      /** @type {number} */
+      lastSabrReloadAt: 0,
 
       onMountedRun: false,
 
@@ -357,34 +382,54 @@ export default defineComponent({
   },
   methods: {
     async reloadView() {
-      await this.handleRouteChange()
+      // Idempotent against concurrent invocation: e.g. the explicit
+      // `saveWatchProgressForReload` -> `reloadView` chain and the `$route` watcher both
+      // call this, which previously made every reload run the whole view reload twice.
+      // Ported from upstream PR #10131 with the finally-release improvement from its
+      // review discussion.
+      if (this.isReloadingView) { return }
 
-      if (this.$refs.player) {
-        await this.destroyPlayer()
-      }
+      this.isReloadingView = true
 
-      // react to route changes...
-      this.videoId = this.$route.params.id
-      this.resetVideoState()
+      try {
+        await this.handleRouteChange()
 
-      this.firstLoad = true
-      this.videoPlayerLoaded = false
-      this.activeFormat = this.defaultVideoFormat
+        if (this.$refs.player) {
+          await this.destroyPlayer()
+        }
 
-      this.checkIfTimestamp()
-      this.checkIfPlaylist()
-      this.setViewingModeOnRouteChange()
+        // react to route changes...
+        const previousVideoId = this.videoId
+        this.videoId = this.$route.params.id
 
-      switch (this.backendPreference) {
-        case 'local':
-          await this.getVideoInformationLocal()
-          break
-        case 'invidious':
-          this.getVideoInformationInvidious()
-          break
+        // The SABR reload governor counts consecutive reloads of the same video, so
+        // navigating to a different video starts a fresh budget
+        if (this.videoId !== previousVideoId && this.sabrReloadCount > 0) {
+          this.sabrReloadCount = 0
+        }
+
+        this.resetVideoState()
+
+        this.firstLoad = true
+        this.videoPlayerLoaded = false
+        this.activeFormat = this.defaultVideoFormat
+
+        this.checkIfTimestamp()
+        this.checkIfPlaylist()
+        this.setViewingModeOnRouteChange()
+
+        switch (this.backendPreference) {
+          case 'local':
+            await this.getVideoInformationLocal()
+            break
+          case 'invidious':
+            this.getVideoInformationInvidious()
+            break
+        }
+      } finally {
+        this.isReloadingView = false
       }
     },
-
     resetVideoState: function () {
       this.isLoading = true
       this.isFamilyFriendly = false
@@ -1989,6 +2034,32 @@ export default defineComponent({
     }, 1000),
 
     async onSabrReloadRequested() {
+      const now = Date.now()
+
+      // An ungoverned chain of server-requested reloads is the doom-loop amplifier
+      // (review §3.3): every iteration amplifies traffic to youtubei + googlevideo and
+      // all counters reset for the new session, so the loop can repeat indefinitely.
+      if (now - this.lastSabrReloadAt > SABR_RELOADS_COUNT_DECAY_MS) {
+        this.sabrReloadCount = 0
+      }
+
+      if (this.sabrReloadCount >= MAX_SABR_RELOADS_PER_VIDEO) {
+        console.error(`[SABR] refusing to reload the player for this video more than ${MAX_SABR_RELOADS_PER_VIDEO} consecutive times`)
+        this.errorMessage = '[SABR] Reloading player according to SABR request did not help after 5 attempts. Please reopen this video.'
+        return
+      }
+
+      const minDelayMs = SABR_RELOADS_COOLDOWN_MS[
+        Math.min(this.sabrReloadCount, SABR_RELOADS_COOLDOWN_MS.length - 1)
+      ]
+      const elapsedMs = now - this.lastSabrReloadAt
+      if (elapsedMs < minDelayMs) {
+        await sabrReloadGovernorSleep(minDelayMs - elapsedMs)
+      }
+
+      this.sabrReloadCount += 1
+      this.lastSabrReloadAt = Date.now()
+
       showToast('Reloading player according to SABR request')
       await this.saveWatchProgressForReload()
       await this.reloadView()

@@ -254,9 +254,13 @@ unbounded-chain hole (§3.3).
 5. [ ] **E. Backoff-aware timeout (`SabrSchemePlugin.js:263`).** Let each backoff wait
    push the op deadline forward so long-but-legitimate backoffs don't churn
    abort/retry cycles. Needs care with shaka's retry semantics — deliberately last.
-6. [ ] **F. Ameliorate the double-`reloadView` amplifier** (§3.5, upstream PR #10131). Held
-   until the upstream diff is reviewed: it is another contributor's fix and courtesy
-   dictates we port it with attribution, or leave it to merge upstream.
+6. [x] **F. Ameliorate the double-`reloadView` amplifier** (§3.5, upstream PR #10131).
+   Ported: `reloadView()` is now idempotent against concurrent invocation via an
+   `isReloadingView` guard, releasing the flag in `finally` so a throwing reload can't
+   lock out future reloads (the improvement suggested in the upstream PR's review
+   discussion by Shadorc). The instrumentation log confirmed the amplifier firing in 3 of
+   the observed reload passes (`$route @ Watch.js:339 → reloadView` stacks). Port is of
+   upstream PR #10131 by PikachuEXE; that PR remains open upstream at review time.
 
 **Sequencing note:** items A–C land in this branch's first remediation series. After B
 and C the maintainer re-runs the §7 repro locally and compares the instrumentation
