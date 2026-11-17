@@ -227,7 +227,7 @@ unbounded-chain hole (§3.3).
    self-redirect detection (target normalizing to the current `sabrUrl` modulo `rn`);
    on trip, use the same breakout as the backoff watchdog (abort + `reload` emit).
    Closes the only unbounded recursion.
-3. [ ] **C. NRP-retry backoff floor (`SabrSchemePlugin.js:305`).** When the last
+3. [x] **C. NRP-retry backoff floor (`SabrSchemePlugin.js:305`).** When the last
    `NextRequestPolicy` sets `backoffTimeMs` to 0/absent, wait a jittered floor
    (250–1000 ms) before the next POST instead of retrying at network speed. Both existing
    breakouts (≥3 real backoffs / ≥100 NRP retries) keep their current semantics; floored

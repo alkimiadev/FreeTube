@@ -313,6 +313,15 @@ function decodePart(data, decoder) {
 const MAX_SABR_REDIRECTS_PER_REQUEST = 5
 
 /**
+ * Jittered floor wait for SABR immediate retries (`NextRequestPolicy.backoffTimeMs`
+ * 0/absent). Spreads otherwise synchronized bursts and degrades them gracefully.
+ * @returns {number} 250-1000 ms
+ */
+function getImmediateRetryFloorDelayMs() {
+  return 250 + Math.floor(Math.random() * 751)
+}
+
+/**
  * Checks whether a `SABR_REDIRECT` target is the endpoint the stream is already using,
  * modulo the `rn` request counter this client sets itself. Honoring such a redirect
  * means recursing on the identical request.
@@ -379,9 +388,25 @@ async function doRequest(
 
   try {
     let shouldReloadDueToBackoffLoop = false
-    if ((currentState.sabrStreamState.nextRequestPolicy?.backoffTimeMs || 0) > 0) {
-      const currentBackoffTimeMs = currentState.sabrStreamState.nextRequestPolicy.backoffTimeMs
-      currentState.eventEmitter.emit('backoff-requested', { backoffMs: currentBackoffTimeMs })
+    const nextRequestPolicy = currentState.sabrStreamState.nextRequestPolicy
+    if (nextRequestPolicy) {
+      // The `backoffTimeMs` proto field is optional; a 0/absent value means "issue the
+      // next request immediately". Honoring that at network speed produced bursts of up
+      // to the NRP retry cap worth of identical POSTs, so immediate-retry requests get
+      // a jittered floor wait instead. Only genuine positive backoffs count as
+      // "backoff requested" (emitted event, tripwire counter), so that a legitimate
+      // zero-backoff policy can never turn a request burst into a reload burst.
+      const rawBackoffTimeMs = nextRequestPolicy.backoffTimeMs || 0
+      const currentBackoffTimeMs = rawBackoffTimeMs > 0
+        ? rawBackoffTimeMs
+        : getImmediateRetryFloorDelayMs()
+
+      if (rawBackoffTimeMs > 0) {
+        currentState.eventEmitter.emit('backoff-requested', { backoffMs: rawBackoffTimeMs })
+      } else if (SABR_DIAGNOSTICS) {
+        currentState.immediateRetryWaitCount += 1
+      }
+
       // Wait but can be aborted
       await new Promise((resolve, reject) => {
         setTimeout(resolve, currentBackoffTimeMs)
@@ -392,12 +417,17 @@ async function doRequest(
       // i.e. backoff time parts received will not reset timeout - counted as video loading issue
       currentState.timeoutController?.resetTimeoutOnce()
 
-      currentState.cumulativeBackOffTimeMs += currentState.sabrStreamState.nextRequestPolicy.backoffTimeMs
-      currentState.cumulativeBackOffRequested += 1
-      const timeoutMs = operationInputs.request.retryParameters.timeout
-      // Detect infinite backoff loop by no. of times requested and cumulative time approaching timeout
-      if (currentState.cumulativeBackOffRequested >= 3 || (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))) {
-        shouldReloadDueToBackoffLoop = true
+      currentState.cumulativeBackOffTimeMs += currentBackoffTimeMs
+      if (rawBackoffTimeMs > 0) {
+        currentState.cumulativeBackOffRequested += 1
+      }
+
+      if (rawBackoffTimeMs > 0) {
+        const timeoutMs = operationInputs.request.retryParameters.timeout
+        // Detect infinite backoff loop by no. of times requested and cumulative time approaching timeout
+        if (currentState.cumulativeBackOffRequested >= 3 || (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))) {
+          shouldReloadDueToBackoffLoop = true
+        }
       }
     }
     if (shouldReloadDueToBackoffLoop || currentState.cumulativeRetryDueToNextRequestPolicy >= 100) {
