@@ -20,6 +20,59 @@ import { deepCopy } from '../utils'
 const AbortableOperation = shaka.util.AbortableOperation
 const ShakaError = shaka.util.Error
 
+const SABR_DIAGNOSTICS = process.env.NODE_ENV === 'development'
+
+const diagnosticPostTimestamps = []
+let diagnosticTotalPostCount = 0
+let diagnosticSessionBreakoutCount = 0
+let diagnosticLastRateLogTime = 0
+
+/**
+ * Dev-only instrumentation: records a ustreamer POST in a sliding 60 s window so the
+ * burst size of NRP-retry loops is observable in the console of development builds.
+ * Release builds contain none of this (dead-code eliminated by webpack).
+ */
+function recordSabrDiagnosticPost() {
+  const now = Date.now()
+  while (diagnosticPostTimestamps.length > 0 && now - diagnosticPostTimestamps[0] > 60000) {
+    diagnosticPostTimestamps.shift()
+  }
+  diagnosticPostTimestamps.push(now)
+  diagnosticTotalPostCount += 1
+
+  // Snapshot when the per-minute rate is noteworthy, at most once every 10 s
+  if (diagnosticPostTimestamps.length >= 30 && now - diagnosticLastRateLogTime > 10000) {
+    diagnosticLastRateLogTime = now
+    // eslint-disable-next-line no-console
+    console.info(`[SABR] ustreamer POST rate: ${diagnosticPostTimestamps.length}/min (60 s sliding window), ${diagnosticTotalPostCount} total this session`)
+  }
+}
+
+/**
+ * Dev-only instrumentation: logs the state that caused a control-plane breakout
+ * (fake reload or server-ordered reload).
+ * @param {string} reason
+ * @param {CurrentState} currentState
+ */
+function logSabrDiagnosticBreakout(reason, currentState) {
+  diagnosticSessionBreakoutCount += 1
+
+  const now = Date.now()
+  while (diagnosticPostTimestamps.length > 0 && now - diagnosticPostTimestamps[0] > 60000) {
+    diagnosticPostTimestamps.shift()
+  }
+
+  // eslint-disable-next-line no-console
+  console.info(
+    `[SABR] breakout ${diagnosticSessionBreakoutCount} (${reason}): ` +
+    `${diagnosticPostTimestamps.length}/min POSTs (60 s window), ${diagnosticTotalPostCount} session total; ` +
+    `op: ${currentState.cumulativeRetryDueToNextRequestPolicy} NRP retries, ` +
+    `${currentState.cumulativeBackOffRequested} backoffs (cumulative ${currentState.cumulativeBackOffTimeMs} ms), ` +
+    `${currentState.immediateRetryWaitCount} immediate-retry waits, ` +
+    `${currentState.cumulativeRedirects} redirects`
+  )
+}
+
 /**
  * @typedef OperationInputs
  * @type {object}
@@ -54,6 +107,8 @@ const ShakaError = shaka.util.Error
  * @property {number} cumulativeBackOffTimeMs
  * @property {number} cumulativeBackOffRequested
  * @property {number} cumulativeRetryDueToNextRequestPolicy
+ * @property {number} cumulativeRedirects
+ * @property {number} immediateRetryWaitCount
  */
 /**
  * @typedef SabrStreamState
@@ -325,6 +380,12 @@ async function doRequest(
     }
     if (shouldReloadDueToBackoffLoop || currentState.cumulativeRetryDueToNextRequestPolicy >= 100) {
       // Fire fake reload event due to detecting retry loop
+      if (SABR_DIAGNOSTICS) {
+        logSabrDiagnosticBreakout(
+          shouldReloadDueToBackoffLoop ? 'backoff watchdog' : 'NRP retry cap',
+          currentState
+        )
+      }
       currentState.sabrStreamState.playerReloadRequested = true
       if (!currentState.abortController.signal.aborted) {
         currentState.abortController.abort()
@@ -459,6 +520,9 @@ async function doRequest(
             if (!reloadPlaybackContext) break
 
             // Whole video cannot be played
+            if (SABR_DIAGNOSTICS) {
+              logSabrDiagnosticBreakout('server-ordered reload (RELOAD_PLAYER_RESPONSE)', currentState)
+            }
             currentState.sabrStreamState.playerReloadRequested = true
             if (!currentState.abortController.signal.aborted) {
               currentState.abortController.abort()
@@ -475,6 +539,9 @@ async function doRequest(
 
     const sabrURL = new URL(currentState.sabrStreamState.sabrUrl)
     sabrURL.searchParams.set('rn', String(currentState.sabrStreamState.requestNumber++))
+    if (SABR_DIAGNOSTICS) {
+      recordSabrDiagnosticPost()
+    }
     response = await fetch(sabrURL.toString(), currentState.requestInit)
 
     operationInputs.headersReceived({})
@@ -821,6 +888,8 @@ export function setupSabrScheme(sabrData, getPlayer, getManifest, playerWidth, p
       cumulativeBackOffTimeMs: 0,
       cumulativeBackOffRequested: 0,
       cumulativeRetryDueToNextRequestPolicy: 0,
+      cumulativeRedirects: 0,
+      immediateRetryWaitCount: 0,
     }
 
     const pendingRequest = doRequest(opInputs, currentState)

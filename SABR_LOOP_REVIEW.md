@@ -218,7 +218,7 @@ unbounded-chain hole (§3.3).
 
 **Order and progress checklist**
 
-1. [ ] **A. Instrumentation (dev-only).** Counters on the SABR control plane, logged to
+1. [x] **A. Instrumentation (dev-only).** Counters on the SABR control plane, logged to
    the devtools console: POSTs-per-minute to the ustreamer endpoint, control-plane
    breakouts (backoff-loop fake reload, NRP-retry cap, redirect loop), and reload requests
    per video view. This is the measuring stick for every other item, and doubles as the
