@@ -312,6 +312,13 @@ function decodePart(data, decoder) {
 
 const MAX_SABR_REDIRECTS_PER_REQUEST = 5
 
+// Measured from real playback (instrumentation baseline): a healthy SABR stream
+// legitimately issues ~3 readahead backoffs totaling ~6.6 s within a single request op
+// early in a video, so a player reload must not be ordered below that; pathological
+// backoff loops are caught by the cumulative-time and request-count arms instead.
+const MAX_LEGIT_BACKOFF_REQUESTS_PER_OP = 12
+const MAX_LEGIT_CUMULATIVE_BACKOFF_MS = 15000
+
 /**
  * Jittered floor wait for SABR immediate retries (`NextRequestPolicy.backoffTimeMs`
  * 0/absent). Spreads otherwise synchronized bursts and degrades them gracefully.
@@ -424,8 +431,14 @@ async function doRequest(
 
       if (rawBackoffTimeMs > 0) {
         const timeoutMs = operationInputs.request.retryParameters.timeout
-        // Detect infinite backoff loop by no. of times requested and cumulative time approaching timeout
-        if (currentState.cumulativeBackOffRequested >= 3 || (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))) {
+        // Detect infinite backoff loops by cumulative waiting time and request count;
+        // the op timeout also covers excessive total waiting. Legitimate readahead
+        // pacing (see MAX_LEGIT_* constants) stays below all of these.
+        if (
+          currentState.cumulativeBackOffRequested >= MAX_LEGIT_BACKOFF_REQUESTS_PER_OP ||
+          currentState.cumulativeBackOffTimeMs >= MAX_LEGIT_CUMULATIVE_BACKOFF_MS ||
+          (timeoutMs > 0 && timeoutMs <= (currentState.cumulativeBackOffTimeMs + currentBackoffTimeMs))
+        ) {
           shouldReloadDueToBackoffLoop = true
         }
       }

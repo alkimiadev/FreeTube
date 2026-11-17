@@ -234,11 +234,23 @@ unbounded-chain hole (§3.3).
    waits do **not** count toward the ≥3 tripwire (so a legitimate zero-backoff policy can
    never turn the request burst into an unbounded *reload* burst — that would trade one
    doom loop for another).
-4. [ ] **D. Reload governor (`Watch.js`).** Throttle `onSabrReloadRequested`; additionally
-   cap consecutive *server-initiated* reloads per video+session (e.g. ≤5), with an
-   escalating cooldown (e.g. 2 s, 5 s, 15 s, …) between them. On cap exhaustion, surface
-   an error state instead of reloading again. Bounds worst-case request rate to YouTube
-   regardless of server behavior.
+4. [x] **D. §5.1 reload chain governor + control-plane watchdog softening.** Two parts:
+   (a) *Watchdog softening (`SabrSchemePlugin.js`).* The instrumentation baseline
+   (maintainer's dev-build console log, 2026-11-17) measured a healthy stream legitimately
+   issuing ~3 readahead backoffs (~6.6 s cumulative) per request-op early in the video, and
+   **all observed breakouts were the ≥3-backoff tripwire firing on that legitimate
+   pattern** — the exact mechanism suspected for "2-7 reloads in the first minute" in
+   #10090. The tripwire count arm is therefore raised from ≥3 to ≥12 backoffs, with a new
+   ≥15 s cumulative-waiting arm and the existing op-timeout arm; the NRP-retry cap (≥100)
+   keeps its role as the request-burst bound, and floored zero-backoff waits still cannot
+   trip any reload (see item C).
+   (b) *View-level governor (`Watch.js`).* `onSabrReloadRequested` now enforces an
+   escalating cooldown between consecutive server-initiated reloads of the same video
+   (0 s, 2 s, 5 s, 5 s, 15 s …), caps them at 5 per video (with a 5-minute decay), and —
+   instead of reloading a 6th time — halts with the watch page's error state
+   (`errorMessage`), matching how player errors such as 403 are surfaced. The cooldown
+   blocks-and-waits rather than dropping the request, because a dropped reload would
+   strand a scheme state with `playerReloadRequested = true` and no recovery path.
 5. [ ] **E. Backoff-aware timeout (`SabrSchemePlugin.js:263`).** Let each backoff wait
    push the op deadline forward so long-but-legitimate backoffs don't churn
    abort/retry cycles. Needs care with shaka's retry semantics — deliberately last.
