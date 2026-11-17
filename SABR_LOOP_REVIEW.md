@@ -83,9 +83,11 @@ if (shouldReloadDueToBackoffLoop || currentState.cumulativeRetryDueToNextRequest
 ```
 
 i.e. up to **100 network-speed POSTs** per shaka request-op before the "fake reload"
-breaks out. Since shaka issues separate ops for video and audio (`rn` counters
-independently advance per op), the effective burst is up to ~200 requests, repeated after
-every player reload, with the counter resetting each session.
+breaks out. Since shaka issues separate ops for video and audio (each op has its own
+`cumulativeRetryDueToNextRequestPolicy` counter — the `rn` parameter is a session-wide
+counter shared across ops, see `sabrStreamState.requestNumber`), the effective burst is up
+to ~200 requests, repeated after every player reload, with the counter resetting each
+session.
 
 This matches the devtools observation of "many per second, the same request"
 (all requests in a burst are byte-identical except `rn=`).
@@ -111,10 +113,17 @@ case UMPPartId.SABR_REDIRECT: {
 
 The recursion guard `cumulativeRetryDueToNextRequestPolicy` is only incremented for
 `NextRequestPolicy` retries (line 526-529). A redirect chain that points back to itself
-(or ping-pongs between two endpoints) is therefore an **unbounded, zero-delay infinite
-recursion** in `doRequest`. This is the most severe hole in the file. Whether production
+(or ping-pongs between two endpoints) is therefore an unbounded, zero-delay infinite
+recursion in `doRequest`. This is the most severe hole in the file. Whether production
 traffic actually hits a self-redirect is unconfirmed, but the code admits it without any
 cap.
+
+**Precision note:** the recursion is only *zero-delay* when no `NextRequestPolicy` with a
+positive `backoffTimeMs` is in play. `sabrStreamState.nextRequestPolicy` persists across
+ops (it is only overwritten when a new NRP part arrives), so a stale positive backoff
+would add a wait per redirect iteration and could eventually trip the ≥3-backoff
+watchdog (§3.3). The truly unbounded case — a redirect loop with zero/absent
+`backoffTimeMs`, exactly the §3.1 regime — is unaffected.
 
 ### 3.3 The player-reload chain is unbounded and unthrottled (HIGH — best fit for the reports)
 
