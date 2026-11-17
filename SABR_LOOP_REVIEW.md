@@ -200,9 +200,59 @@ unbounded-chain hole (§3.3).
 
 ---
 
-## 5. Candidate fixes for this fork (design notes)
+## 5. Remediation plan for this fork
 
-Ranked; 1+2 are the minimum viable pair.
+**Process model**
+
+- One commit per change, on this branch, ordered so each change is independently
+  revertable (bisectable) and locally testable.
+- **No unit-test harness.** The codebase (upstream and this fork) carries no test
+  infrastructure at all, none is being introduced. Verification is (a) dev-build manual
+  repro passes on the maintainer's machine following §7, and (b) build-time-gated
+  instrumentation counters (item A) compared before/after. Note: instrumentation is
+  gated behind `process.env.NODE_ENV === 'development'` (webpack-baked per build mode,
+  the existing idiom in e.g. `src/renderer/helpers/player/Mp4SegmentIndexParser.js:86`),
+  so release builds contain none of it.
+- Each item below is updated in-place (checkbox + short verdict) at commit time, so a
+  later session can resume from the list without re-reading the whole thread.
+
+**Order and progress checklist**
+
+1. [ ] **A. Instrumentation (dev-only).** Counters on the SABR control plane, logged to
+   the devtools console: POSTs-per-minute to the ustreamer endpoint, control-plane
+   breakouts (backoff-loop fake reload, NRP-retry cap, redirect loop), and reload requests
+   per video view. This is the measuring stick for every other item, and doubles as the
+   evidence generator for a future upstream contribution (#10090 asked for such data).
+2. [ ] **B. §5.2 redirect cap (`SabrSchemePlugin.js`).** Per-op redirect counter plus
+   self-redirect detection (target normalizing to the current `sabrUrl` modulo `rn`);
+   on trip, use the same breakout as the backoff watchdog (abort + `reload` emit).
+   Closes the only unbounded recursion.
+3. [ ] **C. NRP-retry backoff floor (`SabrSchemePlugin.js:305`).** When the last
+   `NextRequestPolicy` sets `backoffTimeMs` to 0/absent, wait a jittered floor
+   (250–1000 ms) before the next POST instead of retrying at network speed. Both existing
+   breakouts (≥3 real backoffs / ≥100 NRP retries) keep their current semantics; floored
+   waits do **not** count toward the ≥3 tripwire (so a legitimate zero-backoff policy can
+   never turn the request burst into an unbounded *reload* burst — that would trade one
+   doom loop for another).
+4. [ ] **D. Reload governor (`Watch.js`).** Throttle `onSabrReloadRequested`; additionally
+   cap consecutive *server-initiated* reloads per video+session (e.g. ≤5), with an
+   escalating cooldown (e.g. 2 s, 5 s, 15 s, …) between them. On cap exhaustion, surface
+   an error state instead of reloading again. Bounds worst-case request rate to YouTube
+   regardless of server behavior.
+5. [ ] **E. Backoff-aware timeout (`SabrSchemePlugin.js:263`).** Let each backoff wait
+   push the op deadline forward so long-but-legitimate backoffs don't churn
+   abort/retry cycles. Needs care with shaka's retry semantics — deliberately last.
+6. [ ] **F. Ameliorate the double-`reloadView` amplifier** (§3.5, upstream PR #10131). Held
+   until the upstream diff is reviewed: it is another contributor's fix and courtesy
+   dictates we port it with attribution, or leave it to merge upstream.
+
+**Sequencing note:** items A–C land in this branch's first remediation series. After B
+and C the maintainer re-runs the §7 repro locally and compares the instrumentation
+numbers against the pre-fix baseline; item D follows once that baseline is recorded (D
+changes user-visible reload behavior and is safest to design against measured data).
+
+**Original fix sketches** (superseded in ordering/detail by the checklist above, kept
+for the underlying design notes):
 
 1. **Govern the reload chain (Watch.js).** Throttle `onSabrReloadRequested`; additionally
    cap consecutive *server-initiated* reloads per video+session (e.g. ≤5), and apply an
